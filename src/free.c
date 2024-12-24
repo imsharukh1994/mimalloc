@@ -12,68 +12,74 @@ terms of the MIT license. A copy of the license can be found in the file
 #include "mimalloc/prim.h"   // _mi_prim_thread_id()
 #endif
 
-// forward declarations
+// Forward declarations
 static void   mi_check_padding(const mi_page_t* page, const mi_block_t* block);
 static bool   mi_check_is_double_free(const mi_page_t* page, const mi_block_t* block);
 static size_t mi_page_usable_size_of(const mi_page_t* page, const mi_block_t* block);
 static void   mi_stat_free(const mi_page_t* page, const mi_block_t* block);
 
-
 // ------------------------------------------------------
 // Free
 // ------------------------------------------------------
 
-// forward declaration of multi-threaded free (`_mt`) (or free in huge block if compiled with MI_HUGE_PAGE_ABANDON)
+// Forward declaration of multi-threaded free (`_mt`) (or free in huge block if compiled with MI_HUGE_PAGE_ABANDON)
 static mi_decl_noinline void mi_free_block_mt(mi_page_t* page, mi_segment_t* segment, mi_block_t* block);
 
-// regular free of a (thread local) block pointer
-// fast path written carefully to prevent spilling on the stack
+// Regular free of a (thread local) block pointer
+// Fast path written carefully to prevent spilling on the stack
 static inline void mi_free_block_local(mi_page_t* page, mi_block_t* block, bool track_stats, bool check_full)
 {
-  // checks
-  if mi_unlikely(mi_check_is_double_free(page, block)) return;
+  // Checks
+  if (mi_unlikely(mi_check_is_double_free(page, block))) return;
   mi_check_padding(page, block);
-  if (track_stats) { mi_stat_free(page, block); }
+  
+  // Track stats if necessary
+  if (track_stats) { 
+    mi_stat_free(page, block); 
+    mi_track_free_size(block, mi_page_usable_size_of(page, block)); 
+  }
+
   #if (MI_DEBUG>0) && !MI_TRACK_ENABLED  && !MI_TSAN && !MI_GUARDED
+  // Zero out the block for debugging purposes (e.g., use a freed pattern)
   memset(block, MI_DEBUG_FREED, mi_page_block_size(page));
   #endif
-  if (track_stats) { mi_track_free_size(block, mi_page_usable_size_of(page, block)); } // faster then mi_usable_size as we already know the page and that p is unaligned
 
-  // actual free: push on the local free list
+  // Freeing the block: push on the local free list
   mi_block_set_next(page, block, page->local_free);
   page->local_free = block;
-  if mi_unlikely(--page->used == 0) {
+
+  // Check if the page is empty and should be retired, or if it's full
+  if (mi_unlikely(--page->used == 0)) {
     _mi_page_retire(page);
   }
-  else if mi_unlikely(check_full && mi_page_is_in_full(page)) {
+  else if (mi_unlikely(check_full && mi_page_is_in_full(page))) {
     _mi_page_unfull(page);
   }
 }
 
 // Adjust a block that was allocated aligned, to the actual start of the block in the page.
-// note: this can be called from `mi_free_generic_mt` where a non-owning thread accesses the
-// `page_start` and `block_size` fields; however these are constant and the page won't be
-// deallocated (as the block we are freeing keeps it alive) and thus safe to read concurrently.
 mi_block_t* _mi_page_ptr_unalign(const mi_page_t* page, const void* p) {
-  mi_assert_internal(page!=NULL && p!=NULL);
+  mi_assert_internal(page != NULL && p != NULL);
 
   size_t diff = (uint8_t*)p - page->page_start;
   size_t adjust;
-  if mi_likely(page->block_size_shift != 0) {
+
+  if (mi_likely(page->block_size_shift != 0)) {
     adjust = diff & (((size_t)1 << page->block_size_shift) - 1);
-  }
-  else {
+  } else {
     adjust = diff % mi_page_block_size(page);
   }
 
   return (mi_block_t*)((uintptr_t)p - adjust);
 }
 
-// forward declaration for a MI_GUARDED build
+// Guarded mode for debugging (useful for detecting memory access issues)
 #if MI_GUARDED
 static void mi_block_unguard(mi_page_t* page, mi_block_t* block, void* p); // forward declaration
 static inline void mi_block_check_unguard(mi_page_t* page, mi_block_t* block, void* p) {
-  if (mi_block_ptr_is_guarded(block, p)) { mi_block_unguard(page, block, p); }
+  if (mi_block_ptr_is_guarded(block, p)) { 
+    mi_block_unguard(page, block, p); 
+  }
 }
 #else
 static inline void mi_block_check_unguard(mi_page_t* page, mi_block_t* block, void* p) {
@@ -81,7 +87,7 @@ static inline void mi_block_check_unguard(mi_page_t* page, mi_block_t* block, vo
 }
 #endif
 
-// free a local pointer  (page parameter comes first for better codegen)
+// Free a local pointer (page parameter comes first for better codegen)
 static void mi_decl_noinline mi_free_generic_local(mi_page_t* page, mi_segment_t* segment, void* p) mi_attr_noexcept {
   MI_UNUSED(segment);
   mi_block_t* const block = (mi_page_has_aligned(page) ? _mi_page_ptr_unalign(page, p) : (mi_block_t*)p);
@@ -89,52 +95,53 @@ static void mi_decl_noinline mi_free_generic_local(mi_page_t* page, mi_segment_t
   mi_free_block_local(page, block, true /* track stats */, true /* check for a full page */);
 }
 
-// free a pointer owned by another thread (page parameter comes first for better codegen)
+// Free a pointer owned by another thread (page parameter comes first for better codegen)
 static void mi_decl_noinline mi_free_generic_mt(mi_page_t* page, mi_segment_t* segment, void* p) mi_attr_noexcept {
-  mi_block_t* const block = _mi_page_ptr_unalign(page, p); // don't check `has_aligned` flag to avoid a race (issue #865)
+  mi_block_t* const block = _mi_page_ptr_unalign(page, p); // Don't check `has_aligned` flag to avoid a race condition
   mi_block_check_unguard(page, block, p);
   mi_free_block_mt(page, segment, block);
 }
 
-// generic free (for runtime integration)
+// Generic free (for runtime integration)
 void mi_decl_noinline _mi_free_generic(mi_segment_t* segment, mi_page_t* page, bool is_local, void* p) mi_attr_noexcept {
-  if (is_local) mi_free_generic_local(page,segment,p);
-           else mi_free_generic_mt(page,segment,p);
+  if (is_local) {
+    mi_free_generic_local(page, segment, p);
+  } else {
+    mi_free_generic_mt(page, segment, p);
+  }
 }
 
 // Get the segment data belonging to a pointer
-// This is just a single `and` in release mode but does further checks in debug mode
-// (and secure mode) to see if this was a valid pointer.
 static inline mi_segment_t* mi_checked_ptr_segment(const void* p, const char* msg)
 {
   MI_UNUSED(msg);
 
-  #if (MI_DEBUG>0)
-  if mi_unlikely(((uintptr_t)p & (MI_INTPTR_SIZE - 1)) != 0 && !mi_option_is_enabled(mi_option_guarded_precise)) {
+  #if (MI_DEBUG > 0)
+  if (mi_unlikely(((uintptr_t)p & (MI_INTPTR_SIZE - 1)) != 0 && !mi_option_is_enabled(mi_option_guarded_precise))) {
     _mi_error_message(EINVAL, "%s: invalid (unaligned) pointer: %p\n", msg, p);
     return NULL;
   }
   #endif
 
   mi_segment_t* const segment = _mi_ptr_segment(p);
-  if mi_unlikely(segment==NULL) return segment;
+  if (mi_unlikely(segment == NULL)) return segment;
 
-  #if (MI_DEBUG>0)
-  if mi_unlikely(!mi_is_in_heap_region(p)) {
+  #if (MI_DEBUG > 0)
+  if (mi_unlikely(!mi_is_in_heap_region(p))) {
     _mi_warning_message("%s: pointer might not point to a valid heap region: %p\n"
-      "(this may still be a valid very large allocation (over 64MiB))\n", msg, p);
-    if mi_likely(_mi_ptr_cookie(segment) == segment->cookie) {
+                        "(this may still be a valid very large allocation (over 64MiB))\n", msg, p);
+    if (mi_likely(_mi_ptr_cookie(segment) == segment->cookie)) {
       _mi_warning_message("(yes, the previous pointer %p was valid after all)\n", p);
     }
   }
   #endif
-  #if (MI_DEBUG>0 || MI_SECURE>=4)
-  if mi_unlikely(_mi_ptr_cookie(segment) != segment->cookie) {
+
+  #if (MI_DEBUG > 0 || MI_SECURE >= 4)
+  if (mi_unlikely(_mi_ptr_cookie(segment) != segment->cookie)) {
     _mi_error_message(EINVAL, "%s: pointer does not point to a valid heap space: %p\n", msg, p);
     return NULL;
   }
   #endif
-
   return segment;
 }
 
